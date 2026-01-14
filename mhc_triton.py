@@ -455,122 +455,10 @@ def hc_pre_triton(x, hc_weight, alpha_scales, bias, norm_eps=1e-6, hc_eps=1e-6):
     hcomb = hcomb_flat.view(B, S, N, N)
 
     return h_in, hpost, hcomb
-
+    
 
 @triton.jit
 def hc_post_kernel(
-    x_ptr,        # [M, 4, D] bf16
-    h_out_ptr,    # [M, D] bf16
-    H_post_ptr,   # [M, 4] fp32
-    H_comb_ptr,   # [M, 4, 4] fp32  (index: [k, n])
-    y_ptr,        # [M, 4, D] bf16
-    M: tl.constexpr,
-    D: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    pid_m = tl.program_id(0)  # 0..M-1
-    pid_d = tl.program_id(1)  # 0..ceil_div(D, BLOCK_D)-1
-
-    m = pid_m
-    d0 = pid_d * BLOCK_D
-    d = d0 + tl.arange(0, BLOCK_D)
-    d_mask = d < D
-
-    # n = 0..3
-    n = tl.arange(0, 4)
-
-    # base offsets
-    base_hout  = m * D
-    base_hpost = m * 4
-    base_hcomb = m * 16          # 4*4
-    base_x     = m * (4 * D)
-    base_y     = m * (4 * D)
-
-    # load h_out[d]
-    hout = tl.load(h_out_ptr + base_hout + d, mask=d_mask, other=0).to(tl.float32)  # [BD]
-
-    # load H_post[n]
-    hpost = tl.load(H_post_ptr + base_hpost + n).to(tl.float32)  # [4]
-
-    # acc[n, d] = H_post[n] * h_out[d]
-    acc = hpost[:, None] * hout[None, :]  # [4, BD]
-
-    # add sum_k H_comb[k, n] * x[k, d], k=0..3 (完全展开，不跨 program 归约)
-    # k = 0
-    x0 = tl.load(x_ptr + base_x + 0 * D + d, mask=d_mask, other=0).to(tl.float32)  # [BD]
-    w0 = tl.load(H_comb_ptr + base_hcomb + 0 * 4 + n).to(tl.float32)               # [4]
-    acc += w0[:, None] * x0[None, :]
-
-    # k = 1
-    x1 = tl.load(x_ptr + base_x + 1 * D + d, mask=d_mask, other=0).to(tl.float32)
-    w1 = tl.load(H_comb_ptr + base_hcomb + 1 * 4 + n).to(tl.float32)
-    acc += w1[:, None] * x1[None, :]
-
-    # k = 2
-    x2 = tl.load(x_ptr + base_x + 2 * D + d, mask=d_mask, other=0).to(tl.float32)
-    w2 = tl.load(H_comb_ptr + base_hcomb + 2 * 4 + n).to(tl.float32)
-    acc += w2[:, None] * x2[None, :]
-
-    # k = 3
-    x3 = tl.load(x_ptr + base_x + 3 * D + d, mask=d_mask, other=0).to(tl.float32)
-    w3 = tl.load(H_comb_ptr + base_hcomb + 3 * 4 + n).to(tl.float32)
-    acc += w3[:, None] * x3[None, :]
-
-    # store y[n, d]
-    y_ptrs = y_ptr + base_y + n[:, None] * D + d[None, :]
-    tl.store(y_ptrs, acc.to(tl.bfloat16), mask=d_mask[None, :])
-    
-    
-def hc_post_triton(x, h_out, H_post, H_comb):
-    """
-    mHC Post Triton Implementation
-    Input: 
-        h_out: [B, S, D] (BF16) 
-        H_post: [B, S, N] (FP32)
-        H_comb: [B, S, N, N] (FP32)
-        x: [B, S, N, D] (BF16)
-    Output: y (BF16)
-    """
-    assert x.is_npu and h_out.is_npu and H_post.is_npu and H_comb.is_npu
-    x = x.contiguous()
-    h_out = h_out.contiguous()
-    H_post = H_post.contiguous()
-    H_comb = H_comb.contiguous()
-
-    B, S, N, D = x.shape
-    M = B * S
-    K = N * D
-
-    # flatten/view
-    x_flat_MND = x.view(M, N, D)
-    h_out_flat_MD = h_out.view(M, D)
-    H_post_flat_MN = H_post.view(M, N)
-    H_comb_flat_MNN = H_comb.view(M, N, N)
-
-    # alloc output
-    y_flat = torch.empty((M, 4, D), device=h_out.device, dtype=torch.bfloat16)
-
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), triton.cdiv(D, META['BLOCK_D']))
-    
-    # launch kernel
-    grid = lambda META: (M, triton.cdiv(D, META["BLOCK_D"]))
-    grid = lambda META: (M,)
-        
-    hc_post_kernel1[grid](
-        x_flat_MND, 
-        h_out_flat_MD, 
-        H_post_flat_MN, 
-        H_comb_flat_MNN, 
-        y_flat,
-        M=M, D=D,
-        BLOCK_D=min(3072, D),
-    )
-
-    return y_flat.view(B, S, 4, D)
-
-
-@triton.jit
-def hc_post_kernel1(
     x_ptr,        # [M, 4, D] bf16
     h_out_ptr,    # [M, D] bf16
     H_post_ptr,   # [M, 4] fp32
@@ -628,6 +516,49 @@ def hc_post_kernel1(
         # store y[n, d]
         y_ptrs = y_ptr + base_y + n[:, None] * D + d[None, :]
         tl.store(y_ptrs, acc.to(tl.bfloat16), mask=d_mask[None, :])
+        
+        
+def hc_post_triton(x, h_out, H_post, H_comb):
+    """
+    mHC Post Triton Implementation
+    Input: 
+        h_out: [B, S, D] (BF16) 
+        H_post: [B, S, N] (FP32)
+        H_comb: [B, S, N, N] (FP32)
+        x: [B, S, N, D] (BF16)
+    Output: y (BF16)
+    """
+    assert x.is_npu and h_out.is_npu and H_post.is_npu and H_comb.is_npu
+    x = x.contiguous()
+    h_out = h_out.contiguous()
+    H_post = H_post.contiguous()
+    H_comb = H_comb.contiguous()
+
+    B, S, N, D = x.shape
+    M = B * S
+    K = N * D
+
+    # flatten/view
+    x_flat_MND = x.view(M, N, D)
+    h_out_flat_MD = h_out.view(M, D)
+    H_post_flat_MN = H_post.view(M, N)
+    H_comb_flat_MNN = H_comb.view(M, N, N)
+
+    # alloc output
+    y_flat = torch.empty((M, 4, D), device=h_out.device, dtype=torch.bfloat16)
+        
+    hc_post_kernel[(M,)](
+        x_flat_MND, 
+        h_out_flat_MD, 
+        H_post_flat_MN, 
+        H_comb_flat_MNN, 
+        y_flat,
+        M=M, D=D,
+        BLOCK_D=min(3072, D),
+    )
+
+    return y_flat.view(B, S, 4, D)
+
 
 # -----------------------------
 # 精度验证
@@ -784,7 +715,7 @@ if __name__ == "__main__":
     # h_in_kernel: 130 us
     # total: 570 us
     
-    B, S, N, D = 2, 4096, 4, 6144 # D: 1536, 2048, 3072, 6144
+    B, S, N, D = 2, 4096, 4, 1536 # D: 1536, 2048, 3072, 6144
     x, hc_weight, alpha_scales, bias = generate_test_data(B, S, N, D, device)
 
     # check_accuracy_pre(x, hc_weight, alpha_scales, bias)

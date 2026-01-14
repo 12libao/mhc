@@ -52,7 +52,9 @@ def rel_err(a, b):
   return (torch.norm((a - b).abs()) / (torch.norm(b) + 1e-12)).item()
 
 
-def bench(fn, *args, iters=10, warmup=5):
+def bench(fn, *args):
+    iters=10
+    warmup=5
     # 1. Warmup
     for _ in range(warmup):
         fn(*args)
@@ -78,7 +80,11 @@ def bench(fn, *args, iters=10, warmup=5):
     peak_mem = torch.npu.max_memory_allocated()
     active_mem_mb = (peak_mem - begin_mem) / 1024 / 1024  # MB
 
-    return (*out, elapsed_time_us, active_mem_mb)
+    # 如果out是元组，展开它；否则直接返回
+    if isinstance(out, tuple):
+        return (*out, elapsed_time_us, active_mem_mb)
+    else:
+        return (out, elapsed_time_us, active_mem_mb)
 
 def get_npu_properties():
     device = torch.npu.current_device()
@@ -110,6 +116,51 @@ def hc_pre_reference(x, hc_weight, alpha_scales, bias, norm_eps=1e-6, hc_eps=1e-
     return h_in, H_post, H_comb_before
 
 
+def sinkhorn_reference(H_comb_before, hc_eps=1e-6, hc_sinkhorn_iters=20):
+    """
+    Sinkhorn Normalization (A-scheme)
+    Input : H_comb_before [B, S, N, N]
+    Output: H_comb        [B, S, N, N] (approximately doubly stochastic)
+    """
+    # 1) Row-wise softmax, then add eps to every entry
+    H_comb = torch.softmax(H_comb_before, dim=-1) + hc_eps
+
+    # 2) Initial column normalization
+    H_comb = H_comb / (H_comb.sum(dim=-2, keepdim=True) + hc_eps)
+
+    # 3) Alternate normalization: (row -> col), repeated (iters - 1) times
+    for i in range(max(hc_sinkhorn_iters - 1, 0)):
+        H_comb = H_comb / (H_comb.sum(dim=-1, keepdim=True) + hc_eps) # Row Norm
+        H_comb = H_comb / (H_comb.sum(dim=-2, keepdim=True) + hc_eps) # Col Norm
+        
+    return H_comb
+
+def hc_post_reference(x, h_out, H_post, H_comb):
+    """
+    Operator 2: Manifold Projection
+    Input: 
+        h_out: [B, S, D] (BF16) 
+        H_post: [B, S, N] (FP32)
+        H_comb: [B, S, N, N] (FP32)
+        x: [B, S, N, D] (BF16)
+    Output: y (BF16)
+    """
+    h_out_fp32 = h_out.float()
+    x_fp32 = x.float()
+
+    # 1. Broadcast Mul
+    h_post_term = H_post.unsqueeze(-1) * h_out_fp32.unsqueeze(2) # [B, S, N, D]
+
+    # 2. BMM
+    # H_comb [B, S, N, N].T @ x [B, S, N, D]
+    # h_comb_term = torch.matmul(torch.transpose(H_comb, -1, -2), x_fp32)
+    h_comb_term = torch.sum(H_comb.unsqueeze(-1) * x_fp32.unsqueeze(-2), dim=2)
+
+    # 3. Add
+    y = h_post_term + h_comb_term
+
+    return y.to(torch.bfloat16)
+    
 # -----------------------------------------
 # Kernel 1: 计算每个 (B,S) 行的 rsqrt
 # 输入 x_flat: [M, K] BF16，输出 rsqrt: [M] FP32
@@ -334,7 +385,7 @@ def h_in_kernel(
 # -----------------------------
 # Triton-Ascend 封装函数
 # -----------------------------
-def triton_hc_pre(x, hc_weight, alpha_scales, bias, norm_eps=1e-6, hc_eps=1e-6):
+def hc_pre_triton(x, hc_weight, alpha_scales, bias, norm_eps=1e-6, hc_eps=1e-6):
     assert x.is_npu and hc_weight.is_npu
     x = x.contiguous()
     hc_weight = hc_weight.contiguous()
@@ -406,6 +457,178 @@ def triton_hc_pre(x, hc_weight, alpha_scales, bias, norm_eps=1e-6, hc_eps=1e-6):
     return h_in, hpost, hcomb
 
 
+@triton.jit
+def hc_post_kernel(
+    x_ptr,        # [M, 4, D] bf16
+    h_out_ptr,    # [M, D] bf16
+    H_post_ptr,   # [M, 4] fp32
+    H_comb_ptr,   # [M, 4, 4] fp32  (index: [k, n])
+    y_ptr,        # [M, 4, D] bf16
+    M: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid_m = tl.program_id(0)  # 0..M-1
+    pid_d = tl.program_id(1)  # 0..ceil_div(D, BLOCK_D)-1
+
+    m = pid_m
+    d0 = pid_d * BLOCK_D
+    d = d0 + tl.arange(0, BLOCK_D)
+    d_mask = d < D
+
+    # n = 0..3
+    n = tl.arange(0, 4)
+
+    # base offsets
+    base_hout  = m * D
+    base_hpost = m * 4
+    base_hcomb = m * 16          # 4*4
+    base_x     = m * (4 * D)
+    base_y     = m * (4 * D)
+
+    # load h_out[d]
+    hout = tl.load(h_out_ptr + base_hout + d, mask=d_mask, other=0).to(tl.float32)  # [BD]
+
+    # load H_post[n]
+    hpost = tl.load(H_post_ptr + base_hpost + n).to(tl.float32)  # [4]
+
+    # acc[n, d] = H_post[n] * h_out[d]
+    acc = hpost[:, None] * hout[None, :]  # [4, BD]
+
+    # add sum_k H_comb[k, n] * x[k, d], k=0..3 (完全展开，不跨 program 归约)
+    # k = 0
+    x0 = tl.load(x_ptr + base_x + 0 * D + d, mask=d_mask, other=0).to(tl.float32)  # [BD]
+    w0 = tl.load(H_comb_ptr + base_hcomb + 0 * 4 + n).to(tl.float32)               # [4]
+    acc += w0[:, None] * x0[None, :]
+
+    # k = 1
+    x1 = tl.load(x_ptr + base_x + 1 * D + d, mask=d_mask, other=0).to(tl.float32)
+    w1 = tl.load(H_comb_ptr + base_hcomb + 1 * 4 + n).to(tl.float32)
+    acc += w1[:, None] * x1[None, :]
+
+    # k = 2
+    x2 = tl.load(x_ptr + base_x + 2 * D + d, mask=d_mask, other=0).to(tl.float32)
+    w2 = tl.load(H_comb_ptr + base_hcomb + 2 * 4 + n).to(tl.float32)
+    acc += w2[:, None] * x2[None, :]
+
+    # k = 3
+    x3 = tl.load(x_ptr + base_x + 3 * D + d, mask=d_mask, other=0).to(tl.float32)
+    w3 = tl.load(H_comb_ptr + base_hcomb + 3 * 4 + n).to(tl.float32)
+    acc += w3[:, None] * x3[None, :]
+
+    # store y[n, d]
+    y_ptrs = y_ptr + base_y + n[:, None] * D + d[None, :]
+    tl.store(y_ptrs, acc.to(tl.bfloat16), mask=d_mask[None, :])
+    
+    
+def hc_post_triton(x, h_out, H_post, H_comb):
+    """
+    mHC Post Triton Implementation
+    Input: 
+        h_out: [B, S, D] (BF16) 
+        H_post: [B, S, N] (FP32)
+        H_comb: [B, S, N, N] (FP32)
+        x: [B, S, N, D] (BF16)
+    Output: y (BF16)
+    """
+    assert x.is_npu and h_out.is_npu and H_post.is_npu and H_comb.is_npu
+    x = x.contiguous()
+    h_out = h_out.contiguous()
+    H_post = H_post.contiguous()
+    H_comb = H_comb.contiguous()
+
+    B, S, N, D = x.shape
+    M = B * S
+    K = N * D
+
+    # flatten/view
+    x_flat_MND = x.view(M, N, D)
+    h_out_flat_MD = h_out.view(M, D)
+    H_post_flat_MN = H_post.view(M, N)
+    H_comb_flat_MNN = H_comb.view(M, N, N)
+
+    # alloc output
+    y_flat = torch.empty((M, 4, D), device=h_out.device, dtype=torch.bfloat16)
+
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), triton.cdiv(D, META['BLOCK_D']))
+    
+    # launch kernel
+    grid = lambda META: (M, triton.cdiv(D, META["BLOCK_D"]))
+    grid = lambda META: (M,)
+        
+    hc_post_kernel1[grid](
+        x_flat_MND, 
+        h_out_flat_MD, 
+        H_post_flat_MN, 
+        H_comb_flat_MNN, 
+        y_flat,
+        M=M, D=D,
+        BLOCK_D=min(3072, D),
+    )
+
+    return y_flat.view(B, S, 4, D)
+
+
+@triton.jit
+def hc_post_kernel1(
+    x_ptr,        # [M, 4, D] bf16
+    h_out_ptr,    # [M, D] bf16
+    H_post_ptr,   # [M, 4] fp32
+    H_comb_ptr,   # [M, 4, 4] fp32  (index: [k, n])
+    y_ptr,        # [M, 4, D] bf16
+    M: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid = tl.program_id(0)   # one program handles one m = (b,s)
+    m = pid
+    if m >= M:
+        return
+
+    # n=0..3
+    n = tl.arange(0, 4)
+
+    base_hout  = m * D
+    base_hpost = m * 4
+    base_hcomb = m * 16          # 4*4
+    base_x     = m * (4 * D)
+    base_y     = m * (4 * D)
+
+    # H_post[n] (fp32)
+    hpost = tl.load(H_post_ptr + base_hpost + n).to(tl.float32)  # [4]
+
+    # H_comb[k,n] 全部预加载（fp32），后面每个 D-tile 复用
+    w0 = tl.load(H_comb_ptr + base_hcomb + 0 * 4 + n).to(tl.float32)  # [4]
+    w1 = tl.load(H_comb_ptr + base_hcomb + 1 * 4 + n).to(tl.float32)  # [4]
+    w2 = tl.load(H_comb_ptr + base_hcomb + 2 * 4 + n).to(tl.float32)  # [4]
+    w3 = tl.load(H_comb_ptr + base_hcomb + 3 * 4 + n).to(tl.float32)  # [4]
+
+    # kernel 内部切 D
+    for d0 in tl.static_range(0, D, BLOCK_D):
+        d = d0 + tl.arange(0, BLOCK_D)
+        d_mask = d < D
+
+        # h_out[d]
+        hout = tl.load(h_out_ptr + base_hout + d, mask=d_mask, other=0).to(tl.float32)  # [BD]
+
+        # h_post_term: H_post[n] * h_out[d]
+        acc = hpost[:, None] * hout[None, :]  # [4, BD]
+
+        # x[k, d] + comb term（k=0..3 完全展开）
+        x0 = tl.load(x_ptr + base_x + 0 * D + d, mask=d_mask, other=0).to(tl.float32)
+        x1 = tl.load(x_ptr + base_x + 1 * D + d, mask=d_mask, other=0).to(tl.float32)
+        x2 = tl.load(x_ptr + base_x + 2 * D + d, mask=d_mask, other=0).to(tl.float32)
+        x3 = tl.load(x_ptr + base_x + 3 * D + d, mask=d_mask, other=0).to(tl.float32)
+
+        acc += w0[:, None] * x0[None, :]
+        acc += w1[:, None] * x1[None, :]
+        acc += w2[:, None] * x2[None, :]
+        acc += w3[:, None] * x3[None, :]
+
+        # store y[n, d]
+        y_ptrs = y_ptr + base_y + n[:, None] * D + d[None, :]
+        tl.store(y_ptrs, acc.to(tl.bfloat16), mask=d_mask[None, :])
+
 # -----------------------------
 # 精度验证
 # -----------------------------
@@ -439,11 +662,11 @@ def generate_test_data(B, S, N, D, device):
     return x, hc_weight, alpha_scales, bias
 
 
-def check_accuracy(x, hc_weight, alpha_scales, bias):
+def check_accuracy_pre(x, hc_weight, alpha_scales, bias):
     
     stream = torch.npu.current_stream()
     stream.synchronize()
-    h_in_t, hpost_t, hcomb_t = triton_hc_pre(x, hc_weight, alpha_scales, bias)
+    h_in_t, hpost_t, hcomb_t = hc_pre_triton(x, hc_weight, alpha_scales, bias)
     h_in_g, hpost_g, hcomb_g = hc_pre_reference(x, hc_weight, alpha_scales, bias)
     stream.synchronize()
     
@@ -460,22 +683,56 @@ def check_accuracy(x, hc_weight, alpha_scales, bias):
     
     return
 
-def run_profiler(x, hc_weight, alpha_scales, bias):
+def check_accuracy_post(x, hc_weight, alpha_scales, bias):
     
-    print("Profiling Triton mHC-Pre...")
-    profiler_wrapper(triton_hc_pre, x, hc_weight, alpha_scales, bias)
+    stream = torch.npu.current_stream()
+    stream.synchronize()
+    h_in, h_post, h_comb_before = hc_pre_reference(x, hc_weight, alpha_scales, bias)
+    H_comb = sinkhorn_reference(h_comb_before)
     
-    # print("Profiling Golden mHC-Pre...")
+    y_g = hc_post_reference(x, h_in, h_post, H_comb)
+    y_t = hc_post_triton(x, h_in, h_post, H_comb)
+    
+    stream.synchronize()
+    
+    # 对齐 dtype
+    assert h_in.dtype == torch.bfloat16
+    assert h_post.dtype == torch.float32
+    assert H_comb.dtype == torch.float32
+    assert y_t.dtype == torch.bfloat16
+    assert y_g.dtype == torch.bfloat16
+    
+    assert_close_like_example(y_t.float(), y_g.float(), "h_in(bf16->fp32)", atol=2**-5, rtol=2**-5)
+    
+    print("All checks passed.")
+    
+    return
+
+def run_profiler_pre(x, hc_weight, alpha_scales, bias):
+    
+    profiler_wrapper(hc_pre_triton, x, hc_weight, alpha_scales, bias)
+    
     # profiler_wrapper(hc_pre_reference, x, hc_weight, alpha_scales, bias)
     
     return
 
-def run_benchmark(x, hc_weight, alpha_scales, bias):
+def run_profiler_post(x, hc_weight, alpha_scales, bias):
+    
+    h_in, h_post, h_comb_before = hc_pre_reference(x, hc_weight, alpha_scales, bias)
+    H_comb = sinkhorn_reference(h_comb_before)
+    
+    # profiler_wrapper(hc_post_triton, x, h_in, h_post, H_comb)
+    
+    profiler_wrapper(hc_post_reference, x, h_in, h_post, H_comb)
+    
+    return
+
+def run_benchmark_pre(x, hc_weight, alpha_scales, bias):
    
-    h_in_t, hpost_t, hcomb_t, t_triton, m_triton = bench(triton_hc_pre, x, hc_weight, alpha_scales, bias)
+    h_in_t, hpost_t, hcomb_t, t_triton, m_triton = bench(hc_pre_triton, x, hc_weight, alpha_scales, bias)
     h_in_g, hpost_g, hcomb_g, t_golden, m_golden = bench(hc_pre_reference, x, hc_weight, alpha_scales, bias)
     
-    e_triton_O = rel_err(h_in_t.float(), h_in_g.float())
+    e_triton = rel_err(h_in_t.float(), h_in_g.float())
     
     # Display Results in Table
     console = Console()
@@ -486,11 +743,34 @@ def run_benchmark(x, hc_weight, alpha_scales, bias):
     table.add_column("RelErr", justify="right", style="red")
 
     table.add_row("Golden mHC-Pre", f"{t_golden:.0f}", f"{m_golden:.1f}", "-")
-    table.add_row("Triton mHC-Pre", f"{t_triton:.0f}", f"{m_triton:.1f}", f"{e_triton_O:.2e}")
+    table.add_row("Triton mHC-Pre", f"{t_triton:.0f}", f"{m_triton:.1f}", f"{e_triton:.2e}")
     console.print(table)
     
     return
 
+def run_benchmark(x, hc_weight, alpha_scales, bias):
+   
+    h_in, h_post, h_comb_before = hc_pre_reference(x, hc_weight, alpha_scales, bias)
+    H_comb = sinkhorn_reference(h_comb_before)
+    
+    y_t, t_triton, m_triton = bench(hc_post_triton, x, h_in, h_post, H_comb)
+    y_g, t_golden, m_golden = bench(hc_post_reference, x, h_in, h_post, H_comb)
+    
+    e_triton = rel_err(y_t.float(), y_g.float())
+    
+    # Display Results in Table
+    console = Console()
+    table = Table(title="\nmHC-Post: B:{}, S:{}, N:{}, D:{}".format(*x.shape), box=box.SIMPLE_HEAVY)
+    table.add_column("Method", justify="left", style="cyan", no_wrap=True)
+    table.add_column("Time (us)", justify="right", style="magenta")
+    table.add_column("Memory (MB)", justify="right", style="green")
+    table.add_column("RelErr", justify="right", style="red")
+
+    table.add_row("Golden mHC-Post", f"{t_golden:.0f}", f"{m_golden:.1f}", "-")
+    table.add_row("Triton mHC-Post", f"{t_triton:.0f}", f"{m_triton:.1f}", f"{e_triton:.2e}")
+    console.print(table)
+    
+    return
 
 if __name__ == "__main__":
     torch.npu.set_device(0)
@@ -507,7 +787,11 @@ if __name__ == "__main__":
     B, S, N, D = 2, 4096, 4, 6144 # D: 1536, 2048, 3072, 6144
     x, hc_weight, alpha_scales, bias = generate_test_data(B, S, N, D, device)
 
-    # check_accuracy(x, hc_weight, alpha_scales, bias)
-    # run_profiler(x, hc_weight, alpha_scales, bias)
+    # check_accuracy_pre(x, hc_weight, alpha_scales, bias)
+    # run_profiler_pre(x, hc_weight, alpha_scales, bias)
+    # run_benchmark_pre(x, hc_weight, alpha_scales, bias)
+    
+    # check_accuracy_post(x, hc_weight, alpha_scales, bias)
+    # run_profiler_post(x, hc_weight, alpha_scales, bias)
     run_benchmark(x, hc_weight, alpha_scales, bias)
     

@@ -76,9 +76,7 @@ def bench(fn, *args, iters=10, warmup=5):
     # 4. 计算指标
     elapsed_time_us = start_event.elapsed_time(end_event) / iters * 1000  # us
     peak_mem = torch.npu.max_memory_allocated()
-    active_mem_mb = (peak_mem - begin_mem) / 1024 / 1024
-    
-    print(f"Finished benchmarking {fn.__name__}")
+    active_mem_mb = (peak_mem - begin_mem) / 1024 / 1024  # MB
 
     return (*out, elapsed_time_us, active_mem_mb)
 
@@ -118,44 +116,41 @@ def hc_pre_reference(x, hc_weight, alpha_scales, bias, norm_eps=1e-6, hc_eps=1e-
 # -----------------------------------------
 @triton.jit
 def rms_rsqrt_kernel(
-    x_flat_ptr,
-    rsqrt_ptr,
+    x_flat_ptr,          # [M, K]
+    rsqrt_ptr,           # [M]
     M: tl.constexpr,
     K: tl.constexpr,
-    num_cores: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     norm_eps: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    num_blocks_m = triton.cdiv(M, BLOCK_M)
+    pid_m = tl.program_id(0)              # 0..ceil_div(M, BLOCK_M)-1
+    m_start = pid_m * BLOCK_M
 
-    for block_m in range(pid, num_blocks_m, num_cores):
-        m_start = block_m * BLOCK_M
-        offs_m = m_start + tl.arange(0, BLOCK_M)
-        m_mask = offs_m < M
+    offs_m = m_start + tl.arange(0, BLOCK_M)
+    m_mask = offs_m < M
 
-        x_blk_ptr = tl.make_block_ptr(
-            base=x_flat_ptr,
-            shape=(M, K),
-            strides=(K, 1),
-            offsets=(m_start, 0),
-            block_shape=(BLOCK_M, BLOCK_K),
-            order=(1, 0),
-        )
+    # 用 block_ptr 方便沿 K 方向 advance
+    x_blk_ptr = tl.make_block_ptr(
+        base=x_flat_ptr,
+        shape=(M, K),
+        strides=(K, 1),
+        offsets=(m_start, 0),
+        block_shape=(BLOCK_M, BLOCK_K),
+        order=(1, 0),
+    )
 
-        acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
 
-        # 沿 K 循环累加 sum(x^2)
-        for k0 in range(0, K, BLOCK_K):
-            x_blk = tl.load(x_blk_ptr, boundary_check=(0, 1)).to(tl.float32)
-            acc += tl.sum(x_blk * x_blk, axis=1)
-            x_blk_ptr = tl.advance(x_blk_ptr, (0, BLOCK_K))
+    # kernel 内部切 K：每次处理 (BLOCK_M, BLOCK_K) 的 tile
+    for _ in tl.static_range(0, K, BLOCK_K):
+        x_blk = tl.load(x_blk_ptr,boundary_check=(0, 1),padding_option="zero").to(tl.float32)
+        acc += tl.sum(x_blk * x_blk, axis=1)
+        x_blk_ptr = tl.advance(x_blk_ptr, (0, BLOCK_K))
 
-        mean = acc / K
-        r = tl.rsqrt(mean + norm_eps)
-        tl.store(rsqrt_ptr + offs_m, r, mask=m_mask)
-
+    mean = acc / K
+    r = tl.rsqrt(mean + norm_eps)
+    tl.store(rsqrt_ptr + offs_m, r, mask=m_mask)
 
 # ----------------------------------------------------------
 # Kernel 2: MatMul + scale(rsqrt) + split + 写出：
@@ -171,117 +166,113 @@ def rms_rsqrt_kernel(
 def hc_matmul_post_kernel(
     x_ptr, w_ptr,
     rsqrt_ptr,
-    hpre_ptr,  # [M,N] fp32 
+    hpre_ptr,  # [M,N] fp32
     hpost_ptr, # [M,N] fp32
     hcomb_ptr, # [M,N*N] fp32
     bias0_ptr, bias1_ptr, bias2_ptr,
     M: tl.constexpr, NT: tl.constexpr, K: tl.constexpr, N: tl.constexpr,
-    num_cores: tl.constexpr,
     alpha0: tl.constexpr, alpha1: tl.constexpr, alpha2: tl.constexpr,
     hc_eps: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    num_blocks_m = triton.cdiv(M, BLOCK_M)
+    pid = tl.program_id(0)          # 0 .. grid-1
+    m_start = pid * BLOCK_M         # 该 program 负责的 M 起始行
+    m = m_start + tl.arange(0, BLOCK_M)  # [BM]
 
-    # 辅助 range，用于加载 bias
-    bias0 = tl.load(bias0_ptr + tl.arange(0, N)) # 加载 4 个 bias
+    # 加载 bias（要求 N、N*N 为 tl.constexpr，且 bias 存储连续）
+    bias0 = tl.load(bias0_ptr + tl.arange(0, N))
     bias1 = tl.load(bias1_ptr + tl.arange(0, N))
     bias2 = tl.load(bias2_ptr + tl.arange(0, N * N))
-        
-    for block_m in range(pid, num_blocks_m, num_cores):
-        m_start = block_m * BLOCK_M  # 这里只有 M 维度的 grid
 
-        # -----------------------------------------------------------
-        # 1. MatMul 计算 (不变)
-        # -----------------------------------------------------------
-        x_blk_ptr = tl.make_block_ptr(
-            base=x_ptr,
-            shape=(M, K),
-            strides=(K, 1),
-            offsets=(m_start, 0),
-            block_shape=(BLOCK_M, BLOCK_K),
-            order=(1, 0),
-        )
-        w_blk_ptr = tl.make_block_ptr(
-            base=w_ptr,
-            shape=(K, NT),
-            strides=(NT, 1),
-            offsets=(0, 0),
-            block_shape=(BLOCK_K, NT),
-            order=(1, 0),
-        )
+    # -----------------------------------------------------------
+    # 1) MatMul
+    # -----------------------------------------------------------
+    x_blk_ptr = tl.make_block_ptr(
+        base=x_ptr,
+        shape=(M, K),
+        strides=(K, 1),
+        offsets=(m_start, 0),
+        block_shape=(BLOCK_M, BLOCK_K),
+        order=(1, 0),
+    )
+    w_blk_ptr = tl.make_block_ptr(
+        base=w_ptr,
+        shape=(K, NT),
+        strides=(NT, 1),
+        offsets=(0, 0),
+        block_shape=(BLOCK_K, NT),
+        order=(1, 0),
+    )
 
-        acc = tl.zeros((BLOCK_M, NT), dtype=tl.float32)
-        acc_rsqrt = tl.zeros((BLOCK_M,), dtype=tl.float32)
-            
-        for _ in range(0, K, BLOCK_K):
-            x_blk = tl.load(x_blk_ptr, boundary_check=(0, 1), padding_option="zero")
-            w_blk = tl.load(w_blk_ptr, boundary_check=(0, 1), padding_option="zero")
-            x_blk = x_blk.to(tl.float32)
-            acc_rsqrt += tl.sum(x_blk * x_blk, axis=1)
-            acc = tl.dot(x_blk, w_blk, acc)
-            x_blk_ptr = tl.advance(x_blk_ptr, (0, BLOCK_K))
-            w_blk_ptr = tl.advance(w_blk_ptr, (BLOCK_K, 0))
+    acc = tl.zeros((BLOCK_M, NT), dtype=tl.float32)
+    acc_rsqrt = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+    for _ in range(0, K, BLOCK_K):
+        x_blk = tl.load(x_blk_ptr, boundary_check=(0, 1), padding_option="zero")
+        w_blk = tl.load(w_blk_ptr, boundary_check=(0, 1), padding_option="zero")
+
+        x_blk = x_blk.to(tl.float32)
+        acc_rsqrt += tl.sum(x_blk * x_blk, axis=1)
+        acc = tl.dot(x_blk, w_blk, acc)
+
+        x_blk_ptr = tl.advance(x_blk_ptr, (0, BLOCK_K))
+        w_blk_ptr = tl.advance(w_blk_ptr, (BLOCK_K, 0))
+
+    mean = acc_rsqrt / K
+    acc_rsqrt = tl.rsqrt(mean + 1e-6)
+    acc = acc * acc_rsqrt[:, None]
  
-        # # Row scale (rsqrt)
-        # offs_m = m_start + tl.arange(0, BLOCK_M)
-        # r = tl.load(rsqrt_ptr + offs_m, mask=offs_m < M, other=0.0).to(tl.float32)
-        # acc = acc * r[:, None]
-        mean = acc_rsqrt / K
-        acc_rsqrt = tl.rsqrt(mean + 1e-6)
-        acc = acc * acc_rsqrt[:, None]
+    # 写回每行的 rsqrt（原代码传了 rsqrt_ptr 但没用）
+    tl.store(rsqrt_ptr + m, acc_rsqrt, mask=(m < M))
 
-        # -----------------------------------------------------------
-        # 2. Split & Store
-        # -----------------------------------------------------------
-        # Pre:  cols [0, 4)
-        # Post: cols [4, 8)
-        # Comb: cols [8, 24)
+    # # load rsqrt 并 scale
+    # rsqrt = tl.load(rsqrt_ptr + m, mask=(m < M))
+    # acc = acc * rsqrt[:, None]
 
-        # for s in tl.parallel(BLOCK_M // SUB_BM):
-        # 注意：acc 依然保留在寄存器中
-        acc_sub = tl.extract_slice(acc, (0, 0), (BLOCK_M, NT), (1, 1))
-        acc_pre = tl.extract_slice(acc_sub, (0, 0), (BLOCK_M, N), (1, 1))
-        acc_post = tl.extract_slice(acc_sub, (0, N), (BLOCK_M, N), (1, 1))
-        acc_comb = tl.extract_slice(acc_sub, (0, 2 * N), (BLOCK_M, N * N), (1, 1))
-        
-        hpre = tl.sigmoid(alpha0 * acc_pre + bias0[None, :]) + hc_eps
-        hpost = 2.0 * tl.sigmoid(alpha1 * acc_post + bias1[None, :])
-        hcomb_16 = alpha2 * acc_comb + bias2[None, :]
-        
-        # 使用 block_ptr 存储，规避指针别名
-        hpre_out_ptr = tl.make_block_ptr(
-            base=hpre_ptr,
-            shape=(M, N),
-            strides=(N, 1),
-            offsets=(m_start, 0),
-            block_shape=(BLOCK_M, N),
-            order=(1, 0)
-        )
-        # boundary_check 只需检查 M 维度 (dim 0)，N 维度是齐的
-        tl.store(hpre_out_ptr, hpre, boundary_check=(0, 1))
-        
-        hpost_out_ptr = tl.make_block_ptr(
-            base=hpost_ptr,
-            shape=(M, N),
-            strides=(N, 1),
-            offsets=(m_start, 0),
-            block_shape=(BLOCK_M, N),
-            order=(1, 0)
-        )
-        tl.store(hpost_out_ptr, hpost, boundary_check=(0, 1))
+    # -----------------------------------------------------------
+    # 2) Split & Store
+    #    Pre:  [0, N)
+    #    Post: [N, 2N)
+    #    Comb: [2N, 2N+N*N)
+    # -----------------------------------------------------------
+    acc_pre = tl.extract_slice(acc, (0, 0), (BLOCK_M, N), (1, 1))
+    acc_post = tl.extract_slice(acc, (0, N), (BLOCK_M, N), (1, 1))
+    acc_comb = tl.extract_slice(acc, (0, 2 * N), (BLOCK_M, N * N), (1, 1))
 
-        hcomb_out_ptr = tl.make_block_ptr(
-            base=hcomb_ptr,
-            shape=(M, N * N),
-            strides=(N * N, 1),
-            offsets=(m_start, 0),
-            block_shape=(BLOCK_M, N * N),
-            order=(1, 0),
-        )
-        tl.store(hcomb_out_ptr, hcomb_16, boundary_check=(0, 1))
-            
+    hpre = tl.sigmoid(alpha0 * acc_pre + bias0[None, :]) + hc_eps
+    hpost = 2.0 * tl.sigmoid(alpha1 * acc_post + bias1[None, :])
+    hcomb = alpha2 * acc_comb + bias2[None, :]
+
+    hpre_out_ptr = tl.make_block_ptr(
+        base=hpre_ptr,
+        shape=(M, N),
+        strides=(N, 1),
+        offsets=(m_start, 0),
+        block_shape=(BLOCK_M, N),
+        order=(1, 0),
+    )
+    tl.store(hpre_out_ptr, hpre, boundary_check=(0, 1))
+
+    hpost_out_ptr = tl.make_block_ptr(
+        base=hpost_ptr,
+        shape=(M, N),
+        strides=(N, 1),
+        offsets=(m_start, 0),
+        block_shape=(BLOCK_M, N),
+        order=(1, 0),
+    )
+    tl.store(hpost_out_ptr, hpost, boundary_check=(0, 1))
+
+    hcomb_out_ptr = tl.make_block_ptr(
+        base=hcomb_ptr,
+        shape=(M, N * N),
+        strides=(N * N, 1),
+        offsets=(m_start, 0),
+        block_shape=(BLOCK_M, N * N),
+        order=(1, 0),
+    )
+    tl.store(hcomb_out_ptr, hcomb, boundary_check=(0, 1))
+    
 # ----------------------------------------------------------
 # Kernel 3: h_in = sum_n (H_pre_tmp[n] * x[n,:]) over N
 # 输出 [M, D] BF16
@@ -339,67 +330,6 @@ def h_in_kernel(
         mask=m_mask[:, None] & d_mask[None, :]
     )
 
-
-@triton.jit
-def h_in_kernel_n4_persistent(
-    x_ptr,          # *bf16, [M, 4, D]
-    hpre_ptr,       # *fp32, [M, 4]
-    out_ptr,        # *bf16, [M, D]
-    M: tl.constexpr,
-    D: tl.constexpr,
-    stride_xm: tl.constexpr,
-    stride_xn: tl.constexpr,
-    stride_xd: tl.constexpr,
-    stride_hm: tl.constexpr,
-    stride_hn: tl.constexpr,
-    stride_om: tl.constexpr,
-    stride_od: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    num_programs = tl.num_programs(0)
-
-    num_tiles_m = triton.cdiv(M, BLOCK_M)
-    num_tiles_d = triton.cdiv(D, BLOCK_D)
-    num_tiles = num_tiles_m * num_tiles_d
-
-    n_ids = tl.arange(0, 4)  # N=4
-
-    for tile in range(pid, num_tiles, num_programs):
-        tile_m = tile // num_tiles_d
-        tile_d = tile % num_tiles_d
-
-        m_ids = tile_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BM]
-        d_ids = tile_d * BLOCK_D + tl.arange(0, BLOCK_D)  # [BD]
-
-        m_mask = m_ids < M
-        d_mask = d_ids < D
-
-        # h: [BM, 4]
-        h = tl.load(
-            hpre_ptr + m_ids[:, None] * stride_hm + n_ids[None, :] * stride_hn,
-            mask=m_mask[:, None],
-            other=0.0
-        ).to(tl.float32)
-
-        # x: [BM, 4, BD]
-        x = tl.load(
-            x_ptr
-            + m_ids[:, None, None] * stride_xm
-            + n_ids[None, :, None] * stride_xn
-            + d_ids[None, None, :] * stride_xd,
-            mask=m_mask[:, None, None] & d_mask[None, None, :],
-            other=0.0
-        ).to(tl.float32)
-
-        acc = tl.sum(x * h[:, :, None], axis=1)  # [BM, BD]
-
-        tl.store(
-            out_ptr + m_ids[:, None] * stride_om + d_ids[None, :] * stride_od,
-            acc.to(tl.bfloat16),
-            mask=m_mask[:, None] & d_mask[None, :]
-        )
     
 # -----------------------------
 # Triton-Ascend 封装函数
@@ -434,49 +364,39 @@ def triton_hc_pre(x, hc_weight, alpha_scales, bias, norm_eps=1e-6, hc_eps=1e-6):
     hpost = torch.empty((M, N), device="npu:0", dtype=torch.float32)
     hcomb_flat = torch.empty((M, N * N), device="npu:0", dtype=torch.float32)
     h_in = torch.empty((M, D), device="npu:0", dtype=torch.bfloat16)
-
-    num_cores = get_npu_properties()["num_aicore"]
-
-    # # kernel1: rsqrt
-    # rms_rsqrt_kernel[(num_cores,)](
-    #     x_flat_MK, rsqrt,
-    #     M=M, K=K, num_cores=num_cores,
-    #     BLOCK_M=128, BLOCK_K=128,
+    
+    # # # 不切 K 维度，因为要算整行的平方和
+    # grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), )
+    # rms_rsqrt_kernel[grid](
+    #     x, rsqrt,
+    #     M=M, K=K,
+    #     BLOCK_M=16, 
+    #     BLOCK_K=1024,
     #     norm_eps=norm_eps,
     # )
-        
-    hc_matmul_post_kernel[(num_cores,)](
+    
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), )
+
+    hc_matmul_post_kernel[grid](
         x_flat_MK, hc_weight,
         rsqrt,
         hpre_tmp, hpost, hcomb_flat,
         bias0, bias1, bias2,
         M=M, NT=NT, K=K, N=N,
-        num_cores=num_cores,
         alpha0=a0, alpha1=a1, alpha2=a2,
         hc_eps=hc_eps,
         BLOCK_M=64, BLOCK_K=128,
     )
-    
-    BLOCK_M = 32
-    BLOCK_D = 128
-    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(D, BLOCK_D))
+
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), triton.cdiv(D, META['BLOCK_D']))
     h_in_kernel[grid](
         x_flat_MND, hpre_tmp, h_in,
         M, D,
         x_flat_MND.stride(0), x_flat_MND.stride(1), x_flat_MND.stride(2),
         hpre_tmp.stride(0), hpre_tmp.stride(1),
         h_in.stride(0), h_in.stride(1),
-        BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
+        BLOCK_M=32, BLOCK_D=128,  # 因为 N=4, 实际 BLOCK_M = 32*4=128
     )
-    
-    # h_in_kernel_n4_persistent[(num_cores,)](
-    #     x_3d, hpre_tmp, h_in,
-    #     M=M, D=D,
-    #     stride_xm=stride_xm, stride_xn=stride_xn, stride_xd=stride_xd,
-    #     stride_hm=stride_hm, stride_hn=stride_hn,
-    #     stride_om=stride_om, stride_od=stride_od,
-    #     BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
-    # )
 
     # reshape to original
     h_in = h_in.view(B, S, D)
@@ -559,7 +479,7 @@ def run_benchmark(x, hc_weight, alpha_scales, bias):
     
     # Display Results in Table
     console = Console()
-    table = Table(title="mHC-Pre", box=box.SIMPLE_HEAVY)
+    table = Table(title="\nmHC-Pre: B:{}, S:{}, N:{}, D:{}".format(*x.shape), box=box.SIMPLE_HEAVY)
     table.add_column("Method", justify="left", style="cyan", no_wrap=True)
     table.add_column("Time (us)", justify="right", style="magenta")
     table.add_column("Memory (MB)", justify="right", style="green")
@@ -584,7 +504,7 @@ if __name__ == "__main__":
     # h_in_kernel: 130 us
     # total: 570 us
     
-    B, S, N, D = 2, 4096, 4, 1536 # D: 1536, 2048, 6144
+    B, S, N, D = 2, 4096, 4, 6144 # D: 1536, 2048, 3072, 6144
     x, hc_weight, alpha_scales, bias = generate_test_data(B, S, N, D, device)
 
     # check_accuracy(x, hc_weight, alpha_scales, bias)

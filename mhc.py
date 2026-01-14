@@ -122,14 +122,18 @@ class mHC(nn.Module):
     def hc_post(self, h_out, H_post, H_comb, x):
         """
         Operator 2: Manifold Projection
-        Input: h_out, H_post, H_comb, x
+        Input: 
+            h_out: [B, S, D] (BF16) 
+            H_post: [B, S, N] (FP32)
+            H_comb: [B, S, N, N] (FP32)
+            x: [B, S, N, D] (BF16)
         Output: y (BF16)
         """
         h_out_fp32 = h_out.float()
         x_fp32 = x.float()
 
         # 1. Broadcast Mul
-        h_post_term = H_post.unsqueeze(-1) * h_out_fp32.unsqueeze(2)
+        h_post_term = H_post.unsqueeze(-1) * h_out_fp32.unsqueeze(2) # [B, S, N, D]
 
         # 2. BMM
         # H_comb [B, S, N, N].T @ x [B, S, N, D]
